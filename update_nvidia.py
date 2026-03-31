@@ -1,8 +1,9 @@
 import os
+import re
 import subprocess
 import sys
 import json
-import xml.etree.ElementTree as ET
+import tempfile
 import urllib.request
 import urllib.error
 
@@ -10,18 +11,29 @@ OS_ID = "57"   # Windows 10 64-bit
 LANG  = "1033" # English
 
 
-def run_capture(cmd):
+def run_capture(cmd, timeout=60):
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, shell=True)
+        r = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            shell=True,
+            timeout=timeout,
+        )
         return r.returncode, r.stdout, r.stderr
+    except subprocess.TimeoutExpired:
+        return -2, "", "timeout"
     except Exception as e:
         return -1, "", str(e)
 
 
-def run_live(cmd):
+def run_live(cmd, timeout=120):
     try:
-        r = subprocess.run(cmd, shell=True)
+        r = subprocess.run(cmd, shell=True, timeout=timeout)
         return r.returncode
+    except subprocess.TimeoutExpired:
+        print("[WARN] Command timed out.")
+        return -2
     except Exception as e:
         print(f"[ERROR] {e}")
         return -1
@@ -40,40 +52,67 @@ def fetch(url):
         return None
 
 
+def open_driver_update_ui():
+    # If API lookup fails, send user directly to NVIDIA App driver section.
+    code = run_live('start "" "nvidiaapp://drivers"', timeout=10)
+    if code == 0:
+        print("[DRIVER] Opened NVIDIA App driver section.")
+    else:
+        print("[DRIVER] Could not open NVIDIA App URI. Opening NVIDIA drivers webpage...")
+        run_live('start "" "https://www.nvidia.com/en-us/drivers/"', timeout=10)
+
+
+def parse_lookup_values(raw_text):
+    # NVIDIA lookup endpoints sometimes return malformed XML; regex parsing is more tolerant.
+    items = []
+    for block in re.findall(r"<LookupValue>(.*?)</LookupValue>", raw_text, flags=re.S | re.I):
+        name_m = re.search(r"<Name>(.*?)</Name>", block, flags=re.S | re.I)
+        value_m = re.search(r"<Value>(.*?)</Value>", block, flags=re.S | re.I)
+        if not name_m or not value_m:
+            continue
+        name = re.sub(r"\s+", " ", name_m.group(1)).strip()
+        value = value_m.group(1).strip()
+        if name and value:
+            items.append((name, value))
+    return items
+
+
+def parse_version(v):
+    nums = [int(x) for x in re.findall(r"\d+", v or "")]
+    return tuple(nums)
+
+
+def is_version_newer(installed, latest):
+    return parse_version(latest) > parse_version(installed)
+
+
 # ── GeForce Experience ────────────────────────────────────────────────────────
 
-def check_winget():
+def has_winget():
     code, _, _ = run_capture("winget --version")
-    if code != 0:
-        print("[ERROR] winget not found. Install 'App Installer' from Microsoft Store.")
-        sys.exit(1)
+    return code == 0
 
 
 def check_gfe():
     print("\n[GFE] Checking GeForce Experience...")
-    code, out, _ = run_capture(
-        "winget list --id Nvidia.GeForceExperience --accept-source-agreements"
-    )
-    installed = "Nvidia.GeForceExperience" in out or "GeForce Experience" in out
+    ids = ["NVIDIA.GeForceExperience", "Nvidia.GeForceExperience"]
+    base_args = "--accept-package-agreements --accept-source-agreements --disable-interactivity"
 
-    if not installed:
-        print("[GFE] Not installed. Launching installer...")
-        code = run_live(
-            "winget install --id Nvidia.GeForceExperience "
-            "--accept-package-agreements --accept-source-agreements"
-        )
+    # Try upgrade first; if package exists and is installed this handles pending updates directly.
+    for pkg_id in ids:
+        code = run_live(f"winget upgrade --id {pkg_id} {base_args}", timeout=180)
         if code == 0:
-            print("[GFE] Installation complete.")
-        else:
-            print(f"[ERROR] GFE installation failed (exit {code}).")
-    else:
-        print("[GFE] Installed. Checking for updates...")
-        code = run_live(
-            "winget upgrade --id Nvidia.GeForceExperience "
-            "--accept-package-agreements --accept-source-agreements"
-        )
-        if code != 0:
-            print(f"[WARN] GFE upgrade exited with code {code}. May already be up to date.")
+            print(f"[GFE] Upgrade/install check completed for {pkg_id}.")
+            return
+
+    print("[GFE] Upgrade path not available. Trying fresh install...")
+    for pkg_id in ids:
+        code = run_live(f"winget install --id {pkg_id} {base_args}", timeout=180)
+        if code == 0:
+            print(f"[GFE] Installation completed for {pkg_id}.")
+            return
+
+    print("[WARN] Could not install/update GeForce Experience via winget on this machine.")
 
 
 # ── Driver check ──────────────────────────────────────────────────────────────
@@ -105,10 +144,9 @@ def find_pfid(gpu_name):
     if not xml_data:
         return None
 
-    try:
-        root = ET.fromstring(xml_data)
-    except ET.ParseError as e:
-        print(f"[ERROR] Failed to parse NVIDIA series XML: {e}")
+    series_items = parse_lookup_values(xml_data)
+    if not series_items:
+        print("[ERROR] Could not parse NVIDIA series catalog response.")
         return None
 
     gpu_up = gpu_name.upper().replace("NVIDIA ", "")
@@ -118,9 +156,8 @@ def find_pfid(gpu_name):
     best_psid  = None
     best_score = 0
 
-    for item in root.iter("LookupValue"):
-        series_name = (item.findtext("Name") or "").upper()
-        series_val  = item.findtext("Value") or ""
+    for series_name_raw, series_val in series_items:
+        series_name = series_name_raw.upper()
 
         # Strip noise words to get the core identifier (e.g. "RTX 30")
         core = (series_name
@@ -152,16 +189,14 @@ def find_pfid(gpu_name):
     if not xml_data2:
         return None
 
-    try:
-        root2 = ET.fromstring(xml_data2)
-    except ET.ParseError:
+    family_items = parse_lookup_values(xml_data2)
+    if not family_items:
         return None
 
     gpu_clean = gpu_name.replace("NVIDIA ", "").strip().upper()
     first_val = None
-    for item in root2.iter("LookupValue"):
-        name = (item.findtext("Name") or "").upper()
-        val  = item.findtext("Value") or ""
+    for name_raw, val in family_items:
+        name = name_raw.upper()
         if first_val is None:
             first_val = val
         if gpu_clean in name or name in gpu_clean:
@@ -181,7 +216,9 @@ def check_driver():
 
     pfid = find_pfid(gpu_name)
     if not pfid:
-        print("[WARN] Skipping online version check.")
+        print("[WARN] Could not resolve exact Studio package via API.")
+        print("[DRIVER] Continuing with NVIDIA App direct update flow.")
+        open_driver_update_ui()
         return
 
     url = (
@@ -191,26 +228,59 @@ def check_driver():
     )
     data = fetch(url)
     if not data:
+        print("[DRIVER] API unavailable. Continuing with NVIDIA App direct update flow.")
+        open_driver_update_ui()
         return
 
     try:
         j = json.loads(data)
-        latest_ver = j["IDS"][0]["downloadInfo"]["Version"]
+        info = j["IDS"][0]["downloadInfo"]
+        latest_ver = info["Version"]
+        download_url = (
+            info.get("DownloadURL")
+            or info.get("downloadURL")
+            or info.get("DownloadURLFile")
+            or info.get("downloadURLFile")
+        )
     except (KeyError, IndexError, json.JSONDecodeError, TypeError):
         print("[ERROR] Could not parse driver version from NVIDIA API.")
+        print("[DRIVER] Continuing with NVIDIA App direct update flow.")
+        open_driver_update_ui()
         return
 
-    if installed_ver.strip() == latest_ver.strip():
+    if not is_version_newer(installed_ver, latest_ver):
         print(f"[DRIVER] Latest   : {latest_ver} → UP TO DATE")
     else:
         print(f"[DRIVER] Latest   : {latest_ver} → UPDATE AVAILABLE")
-        print("[DRIVER] Download : https://www.nvidia.com/en-us/drivers/")
+        if not download_url:
+            print("[DRIVER] Download : https://www.nvidia.com/en-us/drivers/")
+            print("[WARN] Download URL not returned by API. Install manually from link above.")
+            return
+
+        installer_path = os.path.join(tempfile.gettempdir(), f"nvidia_studio_{latest_ver}.exe")
+        print("[DRIVER] Downloading installer...")
+        try:
+            urllib.request.urlretrieve(download_url, installer_path)
+        except Exception as e:
+            print(f"[ERROR] Failed to download Studio Driver: {e}")
+            print("[DRIVER] Continuing with NVIDIA App direct update flow.")
+            open_driver_update_ui()
+            return
+
+        print("[DRIVER] Launching installer (UI)...")
+        code = run_live(f'"{installer_path}"')
+        if code == 0:
+            print("[DRIVER] Installer finished.")
+        else:
+            print(f"[WARN] Installer exited with code {code}. Please verify in NVIDIA App/GFE.")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    check_winget()
-    check_gfe()
+    if has_winget():
+        check_gfe()
+    else:
+        print("[WARN] winget not found. Skipping GeForce Experience step.")
     check_driver()
     print("\nDone.")

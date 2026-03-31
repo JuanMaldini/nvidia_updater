@@ -1,0 +1,3 @@
+[2026-03-30/ 12:33:58.692:INFO:browser_app_win.cc(322)] filePath to delete: NVIDIA App\UpdateFramework\status\nvapp\nvAppUpdate.json
+[2026-03-30/ 12:33:58.694:INFO:cefmain_win.cc(391)] Invoking CefInitialize
+[2026-03-30/ 12:33:58.695:WARNING:browser_app_win.cc(548)] Unable to read protocol whitelist from registry, status 2
